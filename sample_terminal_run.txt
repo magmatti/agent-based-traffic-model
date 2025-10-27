@@ -1,0 +1,1 @@
+python src/main.py --minutes 2 --arrival 600 --cycle 60
