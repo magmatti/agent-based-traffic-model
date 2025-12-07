@@ -1,1 +1,5 @@
-pygame
+numpy>=1.26
+numba>=0.60
+mpi4py>=3.1
+matplotlib>=3.8
+tqdm>=4.66
