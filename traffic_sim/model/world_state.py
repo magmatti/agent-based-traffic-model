@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Iterable
 
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange, cuda
 
 from .road_network import RoadNetwork
 from .traffic_lights import TrafficLightsController
@@ -117,6 +117,78 @@ def update_lanes_kernel(
             speeds[lane_idx, i] = new_speed
 
 
+@cuda.jit
+def update_lanes_kernel_cuda(
+    old_positions,   # float64[:, :]
+    old_speeds,      # float64[:, :]
+    stops,           # int32[:, :]
+    counts,          # int32[:]
+    is_green_arr,    # bool_[:]
+    stop_line_arr,   # float64[:]
+    lane_length_arr, # float64[:]
+    safe_gap: float,
+    dt: float,
+    max_speed: float,
+):
+    """
+    CUDA kernel that updates all lanes in parallel.
+
+    Grid:
+        blockIdx.x -> lane index
+        threadIdx.x -> vehicle index in that lane
+    """
+    lane_idx = cuda.blockIdx.x
+    i = cuda.threadIdx.x
+
+    num_lanes = counts.shape[0]
+    if lane_idx >= num_lanes:
+        return
+
+    n = counts[lane_idx]
+    if i >= n:
+        return
+
+    is_green = is_green_arr[lane_idx]
+    stop_line = stop_line_arr[lane_idx]
+    lane_length = lane_length_arr[lane_idx]
+
+    old_pos = old_positions[lane_idx, i]
+    old_speed = old_speeds[lane_idx, i]
+
+    desired_pos = old_pos + max_speed * dt
+    new_speed = max_speed
+
+    # Collision avoidance: use old_positions to avoid data races
+    if i > 0:
+        front_pos = old_positions[lane_idx, i - 1]
+        max_pos = front_pos - safe_gap
+        if desired_pos > max_pos:
+            desired_pos = max_pos
+            if desired_pos <= old_pos + 1e-3:
+                new_speed = 0.0
+
+    # Respect red light: stop before stop line
+    if not is_green:
+        if old_pos < stop_line and desired_pos >= stop_line:
+            desired_pos = stop_line - 0.5
+            if desired_pos <= old_pos + 1e-3:
+                new_speed = 0.0
+
+    # Count stop events (speed > 0 -> 0)
+    if old_speed > 0.1 and new_speed <= 0.1:
+        stops[lane_idx, i] += 1
+
+    # Clamp position to reasonable bounds
+    if desired_pos < 0.0:
+        desired_pos = 0.0
+    if desired_pos > lane_length + 20.0:
+        desired_pos = lane_length + 20.0
+
+    # Write results back to old_positions / old_speeds arrays (they will be copied back)
+    old_positions[lane_idx, i] = desired_pos
+    old_speeds[lane_idx, i] = new_speed
+
+
 class WorldState:
     """
     Manages the full state of the traffic simulation:
@@ -197,9 +269,29 @@ class WorldState:
 
         self.time = t_next
 
+    def step_cuda(self, dt: float) -> None:
+        """
+        CUDA-like step:
+        1) spawn new vehicles
+        2) update movement using a Numba CUDA kernel
+        3) remove finished vehicles + collect metrics
+
+        NOTE: this requires a CUDA-capable GPU and proper driver setup.
+        """
+        t_next = self.time + dt
+        light_state = self.lights.get_state(self.time)
+
+        self._spawn_vehicles(dt)
+        self._update_vehicles_cuda(dt, light_state)
+        self._remove_finished_and_update_metrics(t_next)
+
+        self.time = t_next
+
+
     def get_metrics_summary(self, total_sim_time: float) -> Tuple[int, float, float, float]:
         """Return the aggregated simulation metrics."""
         return self.metrics_raw.compute_summary(total_sim_time)
+
 
     def get_debug_stats(self) -> Dict[str, int]:
         """
@@ -211,6 +303,7 @@ class WorldState:
             "total_spawned": self.metrics_raw.total_spawned,
             "vehicles_in_world_end": len(self.vehicles),
         }
+
 
     # ------------------------ INTERNAL LOGIC ------------------------
 
@@ -239,6 +332,7 @@ class WorldState:
         if spawned_now > 0:
             self.metrics_raw.record_spawned(spawned_now)
 
+
     def _create_vehicle(self, direction: Direction) -> Vehicle:
         """
         Create a new vehicle entering from the given direction.
@@ -265,7 +359,9 @@ class WorldState:
             spawn_time=self.time,
         )
 
+
     # ---------- Sequential update (used by SequentialBackend and MPI ranks) ----------
+
 
     def _update_vehicles_sequential(self, dt: float, light_state: Dict[Direction, bool]) -> None:
         """
@@ -318,7 +414,9 @@ class WorldState:
 
                 front_vehicle = v
 
+
     # ---------- OpenMP-like update using Numba ----------
+
 
     def _update_vehicles_openmp(self, dt: float, light_state: Dict[Direction, bool]) -> None:
         """
@@ -392,6 +490,99 @@ class WorldState:
                 v.position = float(positions[lane_idx, i])
                 v.speed = float(speeds[lane_idx, i])
                 v.stops_count = int(stops[lane_idx, i])
+
+
+    def _update_vehicles_cuda(self, dt: float, light_state: Dict[Direction, bool]) -> None:
+        """
+        Update vehicle movement using a Numba CUDA kernel.
+
+        This is similar to the OpenMP-like implementation, but the core
+        update loop runs on the GPU.
+        """
+        directions_order = self.directions_order
+        num_lanes = len(directions_order)
+
+        # Group vehicles by direction and sort by position descending
+        vehicles_per_lane: List[List[Vehicle]] = []
+        max_n = 0
+
+        for d in directions_order:
+            lane_vehicles = [v for v in self.vehicles if v.direction == d]
+            lane_vehicles.sort(key=lambda v: v.position, reverse=True)
+            vehicles_per_lane.append(lane_vehicles)
+            if len(lane_vehicles) > max_n:
+                max_n = len(lane_vehicles)
+
+        if max_n == 0:
+            return
+
+        # Allocate host arrays
+        old_positions = np.zeros((num_lanes, max_n), dtype=np.float64)
+        old_speeds = np.zeros((num_lanes, max_n), dtype=np.float64)
+        stops = np.zeros((num_lanes, max_n), dtype=np.int32)
+        counts = np.zeros(num_lanes, dtype=np.int32)
+
+        is_green_arr = np.zeros(num_lanes, dtype=np.bool_)
+        stop_line_arr = np.zeros(num_lanes, dtype=np.float64)
+        lane_length_arr = np.zeros(num_lanes, dtype=np.float64)
+
+        # Fill arrays from vehicles and lane geometry
+        for lane_idx, d in enumerate(directions_order):
+            lane_vehicles = vehicles_per_lane[lane_idx]
+            n = len(lane_vehicles)
+            counts[lane_idx] = n
+
+            lane = self.road_network.get_lane(d)
+            is_green_arr[lane_idx] = light_state[d]
+            stop_line_arr[lane_idx] = lane.stop_line_pos
+            lane_length_arr[lane_idx] = lane.length
+
+            for i, v in enumerate(lane_vehicles):
+                old_positions[lane_idx, i] = v.position
+                old_speeds[lane_idx, i] = v.speed
+                stops[lane_idx, i] = v.stops_count
+
+        # Transfer data to GPU
+        d_old_positions = cuda.to_device(old_positions)
+        d_old_speeds = cuda.to_device(old_speeds)
+        d_stops = cuda.to_device(stops)
+        d_counts = cuda.to_device(counts)
+        d_is_green = cuda.to_device(is_green_arr)
+        d_stop_line = cuda.to_device(stop_line_arr)
+        d_lane_length = cuda.to_device(lane_length_arr)
+
+        # Configure CUDA grid: one block per lane, max_n threads per block (clamped)
+        threads_per_block = min(256, max_n)
+        blocks_per_grid = num_lanes
+
+        update_lanes_kernel_cuda[blocks_per_grid, threads_per_block](
+            d_old_positions,
+            d_old_speeds,
+            d_stops,
+            d_counts,
+            d_is_green,
+            d_stop_line,
+            d_lane_length,
+            self.safe_gap,
+            dt,
+            self.max_speed,
+        )
+
+        # Copy results back to host
+        d_old_positions.copy_to_host(old_positions)
+        d_old_speeds.copy_to_host(old_speeds)
+        d_stops.copy_to_host(stops)
+
+        # Write back to vehicle objects
+        for lane_idx, d in enumerate(directions_order):
+            lane_vehicles = vehicles_per_lane[lane_idx]
+            n = counts[lane_idx]
+            for i in range(n):
+                v = lane_vehicles[i]
+                v.position = float(old_positions[lane_idx, i])
+                v.speed = float(old_speeds[lane_idx, i])
+                v.stops_count = int(stops[lane_idx, i])
+
 
     # ---------- Finish handling ----------
 
