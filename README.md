@@ -30,5 +30,5 @@ brew install open-mpi
 Example MPI run (4 processes):
 
 ```bash
-mpiexec -n 4 python run_mpi.py    
+mpiexec -n 4 python run_mpi.py
 ```
