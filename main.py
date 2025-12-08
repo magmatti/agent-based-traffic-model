@@ -4,6 +4,8 @@ from traffic_sim.io.logging_utils import setup_logging, logger
 from traffic_sim.io.results_writer import save_result_as_json
 from traffic_sim.backends import BACKENDS
 
+import logging
+
 
 def choose_backend() -> str:
     print("=== Choose backend ===")
@@ -21,7 +23,7 @@ def choose_backend() -> str:
 
 
 def main():
-    setup_logging()
+    setup_logging(level=logging.ERROR)
 
     print("=== Agent-based Traffic Simulation ===")
 
