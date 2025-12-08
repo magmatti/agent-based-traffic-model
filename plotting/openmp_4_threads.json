@@ -1,0 +1,26 @@
+{
+  "backend": "openmp",
+  "config": {
+    "total_time": 3000.0,
+    "dt": 0.1,
+    "spawn_rate": 0.5,
+    "max_vehicles": 20000,
+    "random_seed": 42,
+    "backend": "openmp",
+    "num_threads": 4,
+    "num_processes": 1,
+    "gpu_block_size": 256,
+    "output_dir": "results",
+    "label": null
+  },
+  "wall_time_seconds": 2.291150024999979,
+  "total_simulated_time": 3000.0,
+  "vehicles_completed": 5904,
+  "avg_travel_time": 18.4311822493126,
+  "avg_stops_per_vehicle": 0.7220528455284553,
+  "throughput_veh_per_min": 118.08,
+  "extra_stats": {
+    "total_spawned": 5939,
+    "vehicles_in_world_end": 35
+  }
+}

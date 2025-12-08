@@ -1,0 +1,29 @@
+{
+  "backend": "mpi",
+  "config": {
+    "total_time": 3000.0,
+    "dt": 0.1,
+    "spawn_rate": 0.5,
+    "max_vehicles": 20000,
+    "random_seed": 42,
+    "backend": "mpi",
+    "num_threads": 1,
+    "num_processes": 1,
+    "gpu_block_size": 256,
+    "output_dir": "results",
+    "label": null
+  },
+  "wall_time_seconds": 0.31415826800002833,
+  "total_simulated_time": 3000.0,
+  "vehicles_completed": 5856,
+  "avg_travel_time": 18.20104166665663,
+  "avg_stops_per_vehicle": 0.7103825136612022,
+  "throughput_veh_per_min": 117.12,
+  "extra_stats": {
+    "num_ranks": 8,
+    "rank": 0,
+    "local_spawned": 1490,
+    "local_finished": 1471,
+    "global_spawned": 5899
+  }
+}
