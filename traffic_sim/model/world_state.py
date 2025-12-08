@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
@@ -16,28 +15,46 @@ class SimulationMetricsRaw:
     finished_stops: List[int] = field(default_factory=list)
     finished_count: int = 0
 
+    total_spawned: int = 0  # number of vehicles spawned in total
 
-    def record_finished(self, v: Vehicle, now: float) -> None:
+    def record_spawned(self, n: int = 1) -> None:
+        """Increment the count of spawned vehicles."""
+        self.total_spawned += n
+
+    def record_finished(self, v: Vehicle) -> None:
+        """Store metrics for a vehicle that finished its trip."""
         if v.finish_time is None:
             return
         self.finished_count += 1
         self.finished_travel_times.append(v.finish_time - v.spawn_time)
         self.finished_stops.append(v.stops_count)
 
-
     def compute_summary(self, total_sim_time: float) -> Tuple[int, float, float, float]:
+        """
+        Compute derived statistics:
+        - total completed vehicles
+        - average travel time
+        - average stops per vehicle
+        - throughput (vehicles per minute)
+        """
         if self.finished_count == 0:
             return 0, 0.0, 0.0, 0.0
 
         avg_travel = sum(self.finished_travel_times) / self.finished_count
         avg_stops = sum(self.finished_stops) / self.finished_count
         throughput_per_min = self.finished_count / (total_sim_time / 60.0)
+
         return self.finished_count, avg_travel, avg_stops, throughput_per_min
-    
+
 
 class WorldState:
     """
-    Main world state: holds vehicles, road network and lights.
+    Manages the full state of the traffic simulation:
+    - vehicles
+    - road/lane geometry
+    - traffic lights
+    - spawning
+    - movement logic
     """
 
     def __init__(
@@ -47,9 +64,10 @@ class WorldState:
         spawn_rate: float,
         max_vehicles: int,
         random_seed: int = 42,
-        max_speed: float = 13.9,  # 13.9 [m/s] -> ~50 km/h
-        safe_gap: float = 5.0, 
+        max_speed: float = 13.9,  # ~50 km/h
+        safe_gap: float = 5.0,    # minimum distance between vehicles
     ) -> None:
+
         self.road_network = road_network
         self.lights = lights
         self.spawn_rate = spawn_rate
@@ -65,49 +83,60 @@ class WorldState:
 
         self.rng = random.Random(random_seed)
 
-
-    # ---------- public API ----------
-
+    # ------------------------ PUBLIC API ------------------------
 
     def step(self, dt: float) -> None:
         """
-        Each step of simulation:
-        - lights update (with get_state() method),
-        - spawning of new vehicles,
-        - updating each vehicles directions,
-        - deletion of finished cars
+        Execute one simulation step:
+        1) spawn new vehicles
+        2) update movement of all vehicles
+        3) remove finished vehicles + collect metrics
         """
         t_next = self.time + dt
+
         light_state = self.lights.get_state(self.time)
 
-        # spawn
+        # Step 1: spawning
         self._spawn_vehicles(dt)
 
-        # move update
+        # Step 2: movement update
         self._update_vehicles(dt, light_state)
 
-        # deletion of finished + updating metrics
+        # Step 3: remove completed vehicles
         self._remove_finished_and_update_metrics(t_next)
 
         self.time = t_next
 
-
     def get_metrics_summary(self, total_sim_time: float) -> Tuple[int, float, float, float]:
+        """Return the aggregated simulation metrics."""
         return self.metrics_raw.compute_summary(total_sim_time)
-    
 
-    # ---------- internal logic ----------
+    def get_debug_stats(self) -> Dict[str, int]:
+        """
+        Return simple debug stats:
+        - total spawned vehicles
+        - how many vehicles are still in the world
+        """
+        return {
+            "total_spawned": self.metrics_raw.total_spawned,
+            "vehicles_in_world_end": len(self.vehicles),
+        }
 
+    # ------------------------ INTERNAL LOGIC ------------------------
 
     def _spawn_vehicles(self, dt: float) -> None:
         """
-        For each direction, with a probability of 
-        p = spawn_rate * dt, a new vehicle is added provided that max_vehicles has not been exceeded
+        Spawn new vehicles based on spawn_rate probability.
+        For each direction:
+        - probability = spawn_rate * dt
+        - cap at max_vehicles
         """
         if len(self.vehicles) >= self.max_vehicles:
             return
 
         spawn_prob = self.spawn_rate * dt
+        spawned_now = 0
+
         for direction in Direction:
             if len(self.vehicles) >= self.max_vehicles:
                 break
@@ -115,10 +144,16 @@ class WorldState:
             if self.rng.random() < spawn_prob:
                 v = self._create_vehicle(direction)
                 self.vehicles.append(v)
+                spawned_now += 1
 
+        if spawned_now > 0:
+            self.metrics_raw.record_spawned(spawned_now)
 
     def _create_vehicle(self, direction: Direction) -> Vehicle:
-        # choosing of driving direction (straight 60%, right 20%, left 20%)
+        """
+        Create a new vehicle entering from the given direction.
+        Turning behavior is randomly chosen.
+        """
         r = self.rng.random()
         if r < 0.6:
             turn: TurnChoice = "straight"
@@ -140,14 +175,17 @@ class WorldState:
             spawn_time=self.time,
         )
 
-
     def _update_vehicles(self, dt: float, light_state: Dict[Direction, bool]) -> None:
         """
-        Movement update:
-        - Process vehicles in each direction independently.
+        Update movement for each direction independently:
+        - sort vehicles by position (frontmost first)
+        - for each vehicle:
+            * try to move with max_speed
+            * adjust to avoid collision with the front vehicle
+            * stop before red light stop line
+            * update stop counter
         """
-
-        # group cars by direction
+        # Group vehicles by direction
         by_dir: Dict[Direction, List[Vehicle]] = {d: [] for d in Direction}
         for v in self.vehicles:
             by_dir[v.direction].append(v)
@@ -159,58 +197,59 @@ class WorldState:
             lane = self.road_network.get_lane(d)
             is_green = light_state[d]
 
-            # isort from the furthest forward (largest postion)
+            # Sort by descending position (frontmost vehicle first)
             vehicles.sort(key=lambda v: v.position, reverse=True)
 
-            # iterate from front to back to know the preceding vehicle
             front_vehicle: Vehicle | None = None
             for v in vehicles:
-                # We assume a simple strategy: we drive at max_speed,
-                # but we cannot:
-                #  - hit the car in front of us,
-                #  - pass the stop_line on a red light.
+
                 desired_pos = v.position + v.max_speed * dt
                 new_speed = v.max_speed
 
-                # constraint imposed by the vehicle in front
+                # Collision avoidance
                 if front_vehicle is not None:
                     max_pos = front_vehicle.position - self.safe_gap
                     if desired_pos > max_pos:
-                        # we must slow down / stop
                         desired_pos = max_pos
                         if desired_pos <= v.position + 1e-3:
                             new_speed = 0.0
 
-                # constraint imposed by the red light
+                # Stop at red light
                 if not is_green:
-                    stop_pos = lane.stop_line_pos
-                    if v.position < stop_pos and desired_pos >= stop_pos:
-                        # we must stop before the stop line
-                        # small margin
-                        desired_pos = stop_pos - 0.5
+                    stop_line = lane.stop_line_pos
+                    if v.position < stop_line and desired_pos >= stop_line:
+                        desired_pos = stop_line - 0.5
                         if desired_pos <= v.position + 1e-3:
                             new_speed = 0.0
 
-                # count stop (from >0 to 0)
+                # Count stop event
                 if v.speed > 0.1 and new_speed <= 0.1:
                     v.stops_count += 1
 
-                v.position = max(0.0, min(desired_pos, lane.length + 10.0))
+                # Clamp to safe bounds
+                if desired_pos < 0.0:
+                    desired_pos = 0.0
+                if desired_pos > lane.length + 20.0:
+                    desired_pos = lane.length + 20.0
+
+                v.position = desired_pos
                 v.speed = new_speed
 
                 front_vehicle = v
 
-
     def _remove_finished_and_update_metrics(self, t_next: float) -> None:
         """
-        deleting vehicles that crossed end of their line
+        Remove vehicles that have reached the end of their lane.
+        A vehicle is considered finished if: position >= lane.length.
         """
         remaining: List[Vehicle] = []
+
         for v in self.vehicles:
             lane = self.road_network.get_lane(v.direction)
             if v.position >= lane.length:
                 v.mark_finished(t_next)
-                self.metrics_raw.record_finished(v, t_next)
+                self.metrics_raw.record_finished(v)
             else:
                 remaining.append(v)
+
         self.vehicles = remaining

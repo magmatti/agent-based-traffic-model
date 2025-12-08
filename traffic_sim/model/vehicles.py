@@ -10,25 +10,23 @@ class Direction(IntEnum):
     WEST = 3
 
 
-# TurnChoice has to use one of the values in Literal
-# thats why Literal type is used
 TurnChoice = Literal["straight", "left", "right"]
 
 
 @dataclass
-class Vehicle: 
+class Vehicle:
     id: int
     direction: Direction
-    turn_choice = TurnChoice
-    position: float
-    speed: float
-    max_speed: float
-    spawn_time: float
-    stops_count: int = 0
-    finished: bool = False
-    finihsed_time: float | None = None
+    turn_choice: TurnChoice      # turning decision
+    position: float              # [m] from the start of the lane
+    speed: float                 # [m/s]
+    max_speed: float             # [m/s]
+    spawn_time: float            # time when the vehicle entered the world
 
-    
+    stops_count: int = 0         # how many times the vehicle had to stop
+    finished: bool = False
+    finish_time: float | None = None
+
     def mark_finished(self, t: float) -> None:
-        self.finihsed = True
-        self.finihsed_time = t
+        self.finished = True
+        self.finish_time = t
