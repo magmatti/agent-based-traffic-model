@@ -18,3 +18,17 @@ conda create -n traffic-sim python=3.11
 conda activate traffic-sim
 pip install -r requirements.txt
 ```
+
+3. In order to run MPI version, open-mpi has to be installed in your system.
+
+On mac: 
+
+```bash
+brew install open-mpi
+```
+
+Example MPI run (4 processes):
+
+```bash
+mpiexec -n 4 python run_mpi.py    
+```
