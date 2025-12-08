@@ -44,6 +44,14 @@ def main():
         max_vehicles=max_veh,
     )
 
+    # Optional per-backend parameters
+    if backend_name == "openmp":
+        try:
+            num_threads = int(input("Number of threads (default 4): ") or "4")
+        except ValueError:
+            num_threads = 4
+        cfg.num_threads = num_threads
+
     logger.info(f"Running simulation with backend='{backend_name}'")
     result = run_single(cfg)
 

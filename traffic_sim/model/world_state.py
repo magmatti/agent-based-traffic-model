@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterable
+
+import numpy as np
+from numba import njit, prange
 
 from .road_network import RoadNetwork
 from .traffic_lights import TrafficLightsController
@@ -47,6 +50,73 @@ class SimulationMetricsRaw:
         return self.finished_count, avg_travel, avg_stops, throughput_per_min
 
 
+@njit(parallel=True)
+def update_lanes_kernel(
+    positions: np.ndarray,
+    speeds: np.ndarray,
+    stops: np.ndarray,
+    counts: np.ndarray,
+    is_green_arr: np.ndarray,
+    stop_line_arr: np.ndarray,
+    lane_length_arr: np.ndarray,
+    safe_gap: float,
+    dt: float,
+    max_speed: float,
+) -> None:
+    """
+    Numba-parallel kernel that updates all lanes.
+
+    positions, speeds, stops have shape (num_lanes, max_n_per_lane)
+    counts[lane_idx] says how many vehicles are valid in that lane.
+    """
+    num_lanes = counts.shape[0]
+
+    for lane_idx in prange(num_lanes):
+        n = counts[lane_idx]
+        if n == 0:
+            continue
+
+        is_green = is_green_arr[lane_idx]
+        stop_line = stop_line_arr[lane_idx]
+        lane_length = lane_length_arr[lane_idx]
+
+        for i in range(n):
+            old_pos = positions[lane_idx, i]
+            old_speed = speeds[lane_idx, i]
+
+            desired_pos = old_pos + max_speed * dt
+            new_speed = max_speed
+
+            # Collision avoidance: keep safe gap to the vehicle in front
+            if i > 0:
+                front_pos = positions[lane_idx, i - 1]
+                max_pos = front_pos - safe_gap
+                if desired_pos > max_pos:
+                    desired_pos = max_pos
+                    if desired_pos <= old_pos + 1e-3:
+                        new_speed = 0.0
+
+            # Respect red light: stop before stop line
+            if not is_green:
+                if old_pos < stop_line and desired_pos >= stop_line:
+                    desired_pos = stop_line - 0.5
+                    if desired_pos <= old_pos + 1e-3:
+                        new_speed = 0.0
+
+            # Count stop events (speed > 0 -> 0)
+            if old_speed > 0.1 and new_speed <= 0.1:
+                stops[lane_idx, i] += 1
+
+            # Clamp position to reasonable bounds
+            if desired_pos < 0.0:
+                desired_pos = 0.0
+            if desired_pos > lane_length + 20.0:
+                desired_pos = lane_length + 20.0
+
+            positions[lane_idx, i] = desired_pos
+            speeds[lane_idx, i] = new_speed
+
+
 class WorldState:
     """
     Manages the full state of the traffic simulation:
@@ -54,7 +124,7 @@ class WorldState:
     - road/lane geometry
     - traffic lights
     - spawning
-    - movement logic
+    - movement logic (sequential, OpenMP-like)
     """
 
     def __init__(
@@ -66,6 +136,7 @@ class WorldState:
         random_seed: int = 42,
         max_speed: float = 13.9,  # ~50 km/h
         safe_gap: float = 5.0,    # minimum distance between vehicles
+        active_directions: Iterable[Direction] | None = None,
     ) -> None:
 
         self.road_network = road_network
@@ -74,6 +145,15 @@ class WorldState:
         self.max_vehicles = max_vehicles
         self.max_speed = max_speed
         self.safe_gap = safe_gap
+
+        # Which directions are actually simulated in this world (for MPI domain decomposition)
+        if active_directions is None:
+            self.active_directions: List[Direction] = [d for d in Direction]
+        else:
+            self.active_directions = list(active_directions)
+
+        # Fixed order of directions used by the OpenMP-like kernel
+        self.directions_order: List[Direction] = list(self.active_directions)
 
         self.time: float = 0.0
         self._next_vehicle_id: int = 0
@@ -87,22 +167,32 @@ class WorldState:
 
     def step(self, dt: float) -> None:
         """
-        Execute one simulation step:
+        Sequential step:
         1) spawn new vehicles
-        2) update movement of all vehicles
+        2) update movement of all vehicles in pure Python
         3) remove finished vehicles + collect metrics
         """
         t_next = self.time + dt
-
         light_state = self.lights.get_state(self.time)
 
-        # Step 1: spawning
         self._spawn_vehicles(dt)
+        self._update_vehicles_sequential(dt, light_state)
+        self._remove_finished_and_update_metrics(t_next)
 
-        # Step 2: movement update
-        self._update_vehicles(dt, light_state)
+        self.time = t_next
 
-        # Step 3: remove completed vehicles
+    def step_openmp(self, dt: float) -> None:
+        """
+        OpenMP-like step:
+        1) spawn new vehicles
+        2) update movement using a Numba-parallel kernel
+        3) remove finished vehicles + collect metrics
+        """
+        t_next = self.time + dt
+        light_state = self.lights.get_state(self.time)
+
+        self._spawn_vehicles(dt)
+        self._update_vehicles_openmp(dt, light_state)
         self._remove_finished_and_update_metrics(t_next)
 
         self.time = t_next
@@ -127,7 +217,7 @@ class WorldState:
     def _spawn_vehicles(self, dt: float) -> None:
         """
         Spawn new vehicles based on spawn_rate probability.
-        For each direction:
+        For each active direction:
         - probability = spawn_rate * dt
         - cap at max_vehicles
         """
@@ -137,7 +227,7 @@ class WorldState:
         spawn_prob = self.spawn_rate * dt
         spawned_now = 0
 
-        for direction in Direction:
+        for direction in self.active_directions:
             if len(self.vehicles) >= self.max_vehicles:
                 break
 
@@ -175,38 +265,32 @@ class WorldState:
             spawn_time=self.time,
         )
 
-    def _update_vehicles(self, dt: float, light_state: Dict[Direction, bool]) -> None:
+    # ---------- Sequential update (used by SequentialBackend and MPI ranks) ----------
+
+    def _update_vehicles_sequential(self, dt: float, light_state: Dict[Direction, bool]) -> None:
         """
-        Update movement for each direction independently:
-        - sort vehicles by position (frontmost first)
-        - for each vehicle:
-            * try to move with max_speed
-            * adjust to avoid collision with the front vehicle
-            * stop before red light stop line
-            * update stop counter
+        Pure Python sequential update of vehicle movement.
+        This is the reference implementation.
         """
-        # Group vehicles by direction
-        by_dir: Dict[Direction, List[Vehicle]] = {d: [] for d in Direction}
+        by_dir: Dict[Direction, List[Vehicle]] = {d: [] for d in self.active_directions}
         for v in self.vehicles:
             by_dir[v.direction].append(v)
 
-        for d, vehicles in by_dir.items():
+        for d in self.active_directions:
+            vehicles = by_dir[d]
             if not vehicles:
                 continue
 
             lane = self.road_network.get_lane(d)
             is_green = light_state[d]
 
-            # Sort by descending position (frontmost vehicle first)
             vehicles.sort(key=lambda v: v.position, reverse=True)
 
             front_vehicle: Vehicle | None = None
             for v in vehicles:
-
                 desired_pos = v.position + v.max_speed * dt
                 new_speed = v.max_speed
 
-                # Collision avoidance
                 if front_vehicle is not None:
                     max_pos = front_vehicle.position - self.safe_gap
                     if desired_pos > max_pos:
@@ -214,7 +298,6 @@ class WorldState:
                         if desired_pos <= v.position + 1e-3:
                             new_speed = 0.0
 
-                # Stop at red light
                 if not is_green:
                     stop_line = lane.stop_line_pos
                     if v.position < stop_line and desired_pos >= stop_line:
@@ -222,11 +305,9 @@ class WorldState:
                         if desired_pos <= v.position + 1e-3:
                             new_speed = 0.0
 
-                # Count stop event
                 if v.speed > 0.1 and new_speed <= 0.1:
                     v.stops_count += 1
 
-                # Clamp to safe bounds
                 if desired_pos < 0.0:
                     desired_pos = 0.0
                 if desired_pos > lane.length + 20.0:
@@ -236,6 +317,83 @@ class WorldState:
                 v.speed = new_speed
 
                 front_vehicle = v
+
+    # ---------- OpenMP-like update using Numba ----------
+
+    def _update_vehicles_openmp(self, dt: float, light_state: Dict[Direction, bool]) -> None:
+        """
+        Update vehicle movement using a Numba-parallel kernel.
+        The logic is equivalent to the sequential version, but operates
+        on NumPy arrays for better performance and easier parallelization.
+        """
+        directions_order = self.directions_order
+        num_lanes = len(directions_order)
+
+        # Group vehicles by direction and sort by position descending
+        vehicles_per_lane: List[List[Vehicle]] = []
+        max_n = 0
+
+        for d in directions_order:
+            lane_vehicles = [v for v in self.vehicles if v.direction == d]
+            lane_vehicles.sort(key=lambda v: v.position, reverse=True)
+            vehicles_per_lane.append(lane_vehicles)
+            if len(lane_vehicles) > max_n:
+                max_n = len(lane_vehicles)
+
+        if max_n == 0:
+            return
+
+        # Allocate arrays for positions, speeds, stops
+        positions = np.zeros((num_lanes, max_n), dtype=np.float64)
+        speeds = np.zeros((num_lanes, max_n), dtype=np.float64)
+        stops = np.zeros((num_lanes, max_n), dtype=np.int32)
+        counts = np.zeros(num_lanes, dtype=np.int32)
+
+        is_green_arr = np.zeros(num_lanes, dtype=np.bool_)
+        stop_line_arr = np.zeros(num_lanes, dtype=np.float64)
+        lane_length_arr = np.zeros(num_lanes, dtype=np.float64)
+
+        # Fill arrays from current vehicle objects
+        for lane_idx, d in enumerate(directions_order):
+            lane_vehicles = vehicles_per_lane[lane_idx]
+            n = len(lane_vehicles)
+            counts[lane_idx] = n
+
+            lane = self.road_network.get_lane(d)
+            is_green_arr[lane_idx] = light_state[d]
+            stop_line_arr[lane_idx] = lane.stop_line_pos
+            lane_length_arr[lane_idx] = lane.length
+
+            for i, v in enumerate(lane_vehicles):
+                positions[lane_idx, i] = v.position
+                speeds[lane_idx, i] = v.speed
+                stops[lane_idx, i] = v.stops_count
+
+        # Run Numba kernel
+        update_lanes_kernel(
+            positions,
+            speeds,
+            stops,
+            counts,
+            is_green_arr,
+            stop_line_arr,
+            lane_length_arr,
+            self.safe_gap,
+            dt,
+            self.max_speed,
+        )
+
+        # Write back updated values to vehicle objects
+        for lane_idx, d in enumerate(directions_order):
+            lane_vehicles = vehicles_per_lane[lane_idx]
+            n = counts[lane_idx]
+            for i in range(n):
+                v = lane_vehicles[i]
+                v.position = float(positions[lane_idx, i])
+                v.speed = float(speeds[lane_idx, i])
+                v.stops_count = int(stops[lane_idx, i])
+
+    # ---------- Finish handling ----------
 
     def _remove_finished_and_update_metrics(self, t_next: float) -> None:
         """
