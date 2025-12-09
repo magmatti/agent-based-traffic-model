@@ -32,3 +32,10 @@ Example MPI run (4 processes):
 ```bash
 mpiexec -n 4 python run_mpi.py
 ```
+
+# Alternatively you can run whole project using run_colab.ipynb
+
+1. Open Google Colab.
+2. Copy run_colab.ipynb notebook to your google drive and open it.
+3. Make sure you are using T4 runtime.
+4. Run all cells one by one.
